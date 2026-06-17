@@ -9,18 +9,25 @@
 
 **Zero dependencies · ~2.5 KB · TypeScript-first · Works everywhere**
 
-`call-latest` wraps any async function so **only the most recent invocation** can resolve or reject. Older in-flight calls are discarded with `StaleError` — the race-condition bug every search box, tab switch, and route change has, solved in one line.
+`call-latest` now centers around `createSmartSearch` for production search flows. It still exposes low-level helpers (`latest`, `dedupe`, `latestDedupe`) when you want manual control.
 
 ```ts
-import { latest, isStale } from "call-latest";
+import {
+  createFetchSearchAdapter,
+  createSmartSearch,
+  dispatchCancelSignal,
+} from "call-latest";
 
-const search = latest(async (query: string) => {
-  const res = await fetch(`/api/search?q=${query}`);
-  return res.json();
+const runSearch = createFetchSearchAdapter({ endpoint: "/api/search" });
+
+const smart = createSmartSearch(runSearch, {
+  enableDelta: true,
+  itemId: (x: { id: string }) => x.id,
+  onDistributedCancel: (oldCallId) =>
+    dispatchCancelSignal("/api/search/cancel", oldCallId),
 });
 
-// User types "r" → "re" → "react"
-// Only "react" updates the UI. Stale responses are ignored.
+const result = await smart.search("react");
 ```
 
 ---
@@ -60,6 +67,29 @@ bun add call-latest
 ---
 
 ## Usage
+
+### Recommended: `createSmartSearch` controller
+
+Use this as your default integration path. It bundles latest-call safety, aborts,
+adaptive debounce, cache, retry, graceful degradation, telemetry, a11y state,
+and distributed cancellation hooks.
+
+```ts
+import { createSmartSearch, createFetchSearchAdapter } from "call-latest";
+
+const runSearch = createFetchSearchAdapter({ endpoint: "/api/search" });
+
+const smart = createSmartSearch(runSearch, {
+  cacheMaxEntries: 50,
+  backtrackTtlMs: 300_000,
+  swr: true,
+  retry: { attempts: 4, baseDelayMs: 250, jitterRatio: 0.3 },
+});
+
+const result = await smart.search("iphone");
+```
+
+### Low-level APIs
 
 ### `latest` — drop stale responses
 
@@ -368,6 +398,44 @@ npm install
 npm test        # run tests
 npm run build   # build dist/
 ```
+
+---
+
+## Migration guide
+
+If you previously used low-level `latest(...)` directly for search input flows,
+prefer moving to `createSmartSearch(...).search(query)` as the primary entrypoint.
+
+```ts
+// before
+const search = latest(fn);
+await search(query);
+
+// after
+const smart = createSmartSearch(runSearch, options);
+await smart.search(query);
+```
+
+Low-level APIs are still available for specialized/custom control paths.
+
+---
+
+## Debugging integration
+
+For quick integration debugging, enable either:
+
+- `debug: true` (logs internal events via `console.debug`)
+- `onMetrics: (metric) => { ... }` (structured telemetry stream)
+
+```ts
+const smart = createSmartSearch(runSearch, {
+  debug: true,
+  onMetrics: (m) => console.log("metric", m),
+});
+```
+
+This helps you see debounce decisions, retries, cache hits/misses, SWR refreshes,
+and mode transitions while wiring the feature.
 
 ---
 

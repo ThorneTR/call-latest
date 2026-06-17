@@ -293,21 +293,32 @@ type SearchState<TItem> = {
 };
 
 export type SmartSearchOptions<TItem> = {
+  /** Minimum debounce window in milliseconds. */
   minDebounceMs?: number;
+  /** Maximum debounce window in milliseconds. */
   maxDebounceMs?: number;
+  /** Baseline debounce used by fixed mode and adaptive weighting. */
   baseDebounceMs?: number;
+  /** Fixed or adaptive debounce strategy. */
   debounceMode?: DebounceMode;
   /**
    * Called on each result to convert item to stable ID for delta/backtrack cache.
    * Required when `enableDelta` is true.
    */
   itemId?: (item: TItem) => string | number;
+  /** Enable `{ add, removeIds }` delta merge behavior. */
   enableDelta?: boolean;
+  /** Enable in-memory backtrack cache for repeated queries. */
   enableBacktrackCache?: boolean;
+  /** Time-to-live for each cached query entry. */
   backtrackTtlMs?: number;
+  /** Maximum number of cached queries (LRU eviction). */
   cacheMaxEntries?: number;
+  /** Return stale cached result immediately and refresh in background. */
   swr?: boolean;
+  /** Called when SWR background refresh returns fresh data. */
   onSWRUpdate?: (query: string, result: SearchResponse<TItem>) => void;
+  /** Enable speculative prefetch flow when prediction hooks are provided. */
   enableSpeculativePrefetch?: boolean;
   /**
    * Return likely next queries for speculative warmup (ex: "iph" -> ["iphone"]).
@@ -345,15 +356,32 @@ export type SmartSearchOptions<TItem> = {
   offload?: (
     payload: { query: string; callId: number; items: TItem[] },
   ) => Promise<TItem[]> | TItem[];
+  /**
+   * Retry config for transient failures (503/429/network).
+   * Uses exponential backoff with jitter.
+   */
   retry?: {
+    /** Total attempts including the first call. */
     attempts?: number;
+    /** Initial retry delay. */
     baseDelayMs?: number;
+    /** Maximum backoff cap. */
     maxDelayMs?: number;
+    /** Extra randomization percentage applied to delay. */
     jitterRatio?: number;
+    /** Override retry decision per error. */
     shouldRetry?: (error: unknown) => boolean;
   };
+  /** Structured telemetry stream for Datadog/Grafana/custom analytics. */
   onMetrics?: (metric: SearchMetric) => void;
+  /** Accessibility state stream for aria-live announcements. */
   onA11yState?: (state: A11yState) => void;
+  /**
+   * Enables console-level diagnostics for integration/debug sessions.
+   * When `true`, logs internal events with `[call-latest]` prefix.
+   * You can pass a custom logger to route debug events.
+   */
+  debug?: boolean | ((event: string, payload: unknown) => void);
 };
 
 type SmartSearchFn<TItem> = (
@@ -384,7 +412,30 @@ export type A11yState =
   | { type: "error"; message: string };
 
 /**
- * Build a compact "Google-like" search orchestrator:
+ * Build a compact "Google-like" search orchestrator.
+ *
+ * This is the recommended public controller for production search experiences.
+ * It composes cancellation, caching, retries, and adaptive behavior behind a
+ * single `search(query)` method.
+ *
+ * @param runSearch Core async search executor. It receives:
+ * - `query`: user query string
+ * - `prev`: previous successful state (`query`, `version`, `items`) for delta protocols
+ * - `ctx`: runtime context (`signal`, `callId`, `mode`, `cancelRemote`)
+ *
+ * Return either:
+ * - full payload: `{ items, version? }`
+ * - delta payload: `{ add?, removeIds?, version? }` (when `enableDelta` is on)
+ *
+ * @param options Smart orchestration options (debounce, cache, local-first, retry, telemetry).
+ *
+ * @returns Controller with:
+ * - `search(query)`: resolves with latest/final result
+ * - `currentDebounce()`: currently computed debounce window
+ * - `mode()`: current load mode (`normal` or `conserve`)
+ * - `reset()`: clears runtime state and invalidates in-flight work
+ *
+ * Build features:
  * - Adaptive debounce
  * - Latest-call + AbortController + distributed cancel signal
  * - Early stale exit before heavy post-processing
@@ -426,6 +477,7 @@ export function createSmartSearch<TItem>(
     retry,
     onMetrics,
     onA11yState,
+    debug = false,
   } = options;
 
   let latestCallId = 0;
@@ -434,13 +486,31 @@ export function createSmartSearch<TItem>(
   let avgTypingGapMs = baseDebounceMs;
   let prevState: SearchState<TItem> | null = null;
   const cache = new Map<string, { value: SearchResponse<TItem>; at: number }>();
-  const emitMetric = (metric: SearchMetric) => onMetrics?.(metric);
-  const emitA11y = (state: A11yState) => onA11yState?.(state);
+  const debugLog =
+    typeof debug === "function"
+      ? debug
+      : debug
+        ? (event: string, payload: unknown) => {
+            // Intentionally lightweight runtime tracing for integration debugging.
+            // eslint-disable-next-line no-console
+            console.debug(`[call-latest] ${event}`, payload);
+          }
+        : undefined;
+
+  const emitMetric = (metric: SearchMetric) => {
+    onMetrics?.(metric);
+    debugLog?.("metric", metric);
+  };
+  const emitA11y = (state: A11yState) => {
+    onA11yState?.(state);
+    debugLog?.("a11y", state);
+  };
 
   const setMode = (next: PerformanceMode) => {
     if (mode !== next) {
       mode = next;
       onModeChange?.(mode);
+      debugLog?.("mode-change", { mode });
     }
   };
 
@@ -540,6 +610,7 @@ export function createSmartSearch<TItem>(
           });
         }
         if (swr) {
+          debugLog?.("swr-start", { query, callId: myCallId });
           void revalidateInBackground(query, myCallId);
         }
         if (myCallId === latestCallId) onLoadingChange?.(false);
@@ -612,6 +683,7 @@ export function createSmartSearch<TItem>(
 
       if (enableSpeculativePrefetch && mode === "normal" && prefetch && predictNextQueries) {
         const guesses = predictNextQueries(query);
+        debugLog?.("prefetch-candidates", { query, guesses: guesses.slice(0, 2) });
         for (const guess of guesses.slice(0, 2)) {
           if (!guess || guess === query) continue;
           void Promise.resolve(prefetch(guess));
@@ -649,6 +721,7 @@ export function createSmartSearch<TItem>(
         prevState = { query, version: result.version, items: result.items };
       }
       onSWRUpdate?.(query, result);
+      debugLog?.("swr-done", { query, callId, itemCount: result.items.length });
       emitMetric({ type: "SWR_REVALIDATED", query, durationMs: Date.now() - startedAt });
     } catch {
       // SWR runs best-effort; ignore.
@@ -666,8 +739,10 @@ export function createSmartSearch<TItem>(
     latestCallId++;
     if (previousId > 0) {
       onDistributedCancel?.(previousId);
+      debugLog?.("distributed-cancel", { previousId, nextId: latestCallId });
     }
     const debounceMs = debounceForNow();
+    debugLog?.("debounce", { query, debounceMs, mode });
     await wait(debounceMs);
     try {
       return await call(query);

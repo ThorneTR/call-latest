@@ -13,21 +13,25 @@ Only the latest async call should win.
 npm install call-latest
 ```
 
-## Quick example
+## Quick example (createSmartSearch controller)
 
 ```ts
-import { latest, isStale } from "call-latest";
+import {
+  createFetchSearchAdapter,
+  createSmartSearch,
+  dispatchCancelSignal,
+} from "call-latest";
 
-const search = latest(async (query: string) => {
-  const res = await fetch(`/api/search?q=${query}`);
-  return res.json();
+const runSearch = createFetchSearchAdapter({ endpoint: "/api/search" });
+
+const smart = createSmartSearch(runSearch, {
+  enableDelta: true,
+  itemId: (x: { id: string }) => x.id,
+  onDistributedCancel: (oldCallId) =>
+    dispatchCancelSignal("/api/search/cancel", oldCallId),
 });
 
-try {
-  await search("react");
-} catch (err) {
-  if (!isStale(err)) throw err;
-}
+const result = await smart.search("react");
 ```
 
 See [README.md](./README.md) for full documentation.
