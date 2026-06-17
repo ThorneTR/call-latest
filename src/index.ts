@@ -119,8 +119,7 @@ export function latest<T extends AnyAsyncFn>(
 
     const callArgs = abort ? [...args, context] : args;
     const run = (fn as unknown as (...a: unknown[]) => ReturnType<T>)(...callArgs);
-
-    return Promise.resolve(run).then(
+    const promise = Promise.resolve(run).then(
       (value) => {
         if (id !== token) {
           onStale?.(args);
@@ -136,6 +135,11 @@ export function latest<T extends AnyAsyncFn>(
         throw error;
       },
     );
+    void promise.catch(() => {
+      // Attach a noop handler immediately so stale/aborted rejections
+      // do not become unhandled between call creation and consumer handlers.
+    });
+    return promise;
   };
 
   wrapped.reset = () => {
@@ -536,7 +540,11 @@ export function createSmartSearch<TItem>(
     const now = Date.now();
     if (lastKeystrokeAt > 0) {
       const gap = now - lastKeystrokeAt;
-      avgTypingGapMs = clamp(Math.round(avgTypingGapMs * 0.7 + gap * 0.3), 60, 1400);
+      avgTypingGapMs = clamp(
+        Math.round(avgTypingGapMs * 0.7 + gap * 0.3),
+        minDebounceMs,
+        1400,
+      );
     }
     lastKeystrokeAt = now;
   };
@@ -589,12 +597,16 @@ export function createSmartSearch<TItem>(
   };
 
   const call = latest(
-    async (query: string, ctx: LatestContext): Promise<SearchResponse<TItem>> => {
+    async (
+      query: string,
+      searchCallId: number,
+      ctx: LatestContext,
+    ): Promise<SearchResponse<TItem>> => {
       const startedAt = Date.now();
       evaluateMode();
       onLoadingChange?.(true);
       emitA11y({ type: "loading", message: "Arama yapiliyor..." });
-      const myCallId = ctx.callId;
+      const latestWrapperCallId = ctx.callId;
 
       // Backtrack cache: instant answer for deleted/revisited query.
       const backtrack = getCached(query);
@@ -610,10 +622,12 @@ export function createSmartSearch<TItem>(
           });
         }
         if (swr) {
-          debugLog?.("swr-start", { query, callId: myCallId });
-          void revalidateInBackground(query, myCallId);
+          debugLog?.("swr-start", { query, callId: searchCallId });
+          setTimeout(() => {
+            void revalidateInBackground(query, searchCallId);
+          }, 0);
         }
-        if (myCallId === latestCallId) onLoadingChange?.(false);
+        if (searchCallId === latestCallId) onLoadingChange?.(false);
         return backtrack;
       }
       emitMetric({ type: "CACHE_MISS", query, durationMs: Date.now() - startedAt });
@@ -624,14 +638,14 @@ export function createSmartSearch<TItem>(
         if (local) {
           setCached(query, local);
           prevState = { query, version: local.version, items: local.items };
-          if (myCallId === latestCallId) onLoadingChange?.(false);
+          if (searchCallId === latestCallId) onLoadingChange?.(false);
           return local;
         }
       }
 
       const smartCtx: SmartSearchContext = {
         signal: ctx.signal,
-        callId: myCallId,
+        callId: searchCallId,
         mode,
         cancelRemote: (supersededCallId: number) => onDistributedCancel?.(supersededCallId),
       };
@@ -644,14 +658,14 @@ export function createSmartSearch<TItem>(
       );
 
       // Early exit before heavy work/json-transform if response is stale.
-      if (myCallId !== latestCallId) {
+      if (searchCallId !== latestCallId) {
         throw new StaleError();
       }
 
       const resolved = isDelta<TItem>(raw) ? mergeDelta(prevState, raw) : raw;
       const workerStarted = Date.now();
       const items = offload
-        ? await offload({ query, callId: myCallId, items: resolved.items })
+        ? await offload({ query, callId: searchCallId, items: resolved.items })
         : resolved.items;
       if (offload) {
         emitMetric({
@@ -666,7 +680,7 @@ export function createSmartSearch<TItem>(
       emitMetric({
         type: "NETWORK_OK",
         query,
-        callId: myCallId,
+        callId: searchCallId,
         durationMs: Date.now() - startedAt,
       });
       if (finalResult.items.length === 0) {
@@ -679,14 +693,14 @@ export function createSmartSearch<TItem>(
         });
       }
 
-      if (myCallId === latestCallId) onLoadingChange?.(false);
+      if (searchCallId === latestCallId) onLoadingChange?.(false);
 
       if (enableSpeculativePrefetch && mode === "normal" && prefetch && predictNextQueries) {
         const guesses = predictNextQueries(query);
         debugLog?.("prefetch-candidates", { query, guesses: guesses.slice(0, 2) });
         for (const guess of guesses.slice(0, 2)) {
           if (!guess || guess === query) continue;
-          void Promise.resolve(prefetch(guess));
+          void Promise.resolve(prefetch(guess)).catch(() => {});
         }
       }
 
@@ -729,9 +743,11 @@ export function createSmartSearch<TItem>(
   };
 
   const wait = (ms: number) =>
-    new Promise<void>((resolve) => {
-      setTimeout(resolve, ms);
-    });
+    ms <= 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          setTimeout(resolve, ms);
+        });
 
   const search = async (query: string): Promise<SearchResponse<TItem>> => {
     touchTyping();
@@ -744,9 +760,18 @@ export function createSmartSearch<TItem>(
     const debounceMs = debounceForNow();
     debugLog?.("debounce", { query, debounceMs, mode });
     await wait(debounceMs);
+    const promise = call(query, latestCallId);
+    void promise.catch((error) => {
+      if (isStale(error)) {
+        return;
+      }
+    });
     try {
-      return await call(query);
+      return await promise;
     } catch (error) {
+      if (isStale(error)) {
+        throw error;
+      }
       emitMetric({
         type: "NETWORK_ERROR",
         query,
@@ -937,3 +962,15 @@ function getErrorMessage(error: unknown): string {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// Export all features
+export * from "./priority.js";
+export * from "./request-budget.js";
+export * from "./streaming.js";
+export * from "./cross-tab.js";
+export * from "./persistent-cache.js";
+export * from "./multi-level-cache.js";
+export * from "./distributed-dedupe.js";
+export * from "./telemetry.js";
+export * from "./ssr.js";
+export * from "./edge.js";
